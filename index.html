@@ -1,0 +1,722 @@
+<!DOCTYPE html>
+<title>RE</title>
+<script>
+"use strict";
+
+function DataStream(buf)
+{
+  this.buf = buf;
+  this.pos = 0;
+}
+
+DataStream.prototype.read = function(Type, elems)
+{
+  var ret = new Type(this.buf, this.pos, elems);
+  this.pos += ret.byteLength;
+  return ret;
+};
+
+DataStream.prototype.i8  = function(elems) { return this.read(Int8Array, elems); };
+DataStream.prototype.u8  = function(elems) { return this.read(Uint8Array, elems); };
+DataStream.prototype.i16 = function(elems) { return this.read(Int16Array, elems); };
+DataStream.prototype.u16 = function(elems) { return this.read(Uint16Array, elems); };
+DataStream.prototype.i32 = function(elems) { return this.read(Int32Array, elems); };
+DataStream.prototype.u32 = function(elems) { return this.read(Uint32Array, elems); };
+
+DataStream.prototype.ni16 = function(elems) // normalized 16-bit
+{
+  var arr = this.read(Int16Array, elems);
+  var ret = new Float32Array(elems);
+  for (var i = 0; i < elems; ++i)
+    ret[i] = arr[i] / 32767;
+  return ret;
+};
+
+DataStream.prototype.f16 = function(elems) // fixed point 16-bit
+{
+  var arr = this.read(Int16Array, elems);
+  var ret = new Float32Array(elems);
+  for (var i = 0; i < elems; ++i)
+    ret[i] = arr[i] / 4096;
+  return ret;
+};
+
+
+DataStream.prototype.readObj = function(props, type)
+{
+  var obj = {};
+  var vals = this[type](props.length);
+  for (var i = 0; i < props.length; ++i)
+    obj[props[i]] = vals[i];
+  return obj;
+}
+
+DataStream.prototype.readObjArr = function(props, len, type)
+{
+  var arr = [];
+  for (var i = 0; i < len; ++i)
+    arr.push(this.readObj(props, type));
+  return arr;
+}
+
+
+
+function read_sec0(buf)
+{
+  var mat3 = ['x', 'y', 'z'];
+  var stream = new DataStream(buf);
+
+  var h = stream.readObj([
+    'treeOff', 'keyFrameOff', 'nMeshes', 'keyFrameSz',
+  ], 'u16');
+
+  var meshes = new Array(h.nMeshes);
+
+  for (var i = 0; i < meshes.length; ++i)
+    meshes[i] = { offset: stream.i16(3), };
+
+  stream.pos = h.treeOff;
+
+  var mesh_h = stream.readObjArr(['nChildren', 'off'], meshes.length, 'u16');
+
+  for (i = 0; i < meshes.length; ++i) {
+    stream.pos = h.treeOff + mesh_h[i].off;
+    meshes[i].children = stream.u8(mesh_h[i].nChildren);
+  }
+
+  var keyframes = [];
+  stream.pos = h.keyFrameOff;
+
+  while (stream.pos <= buf.byteLength - h.keyFrameSz) {
+    keyframes.push({
+      offset:       stream.readObj(mat3, 'ni16'),
+      bodyRotation: stream.readObj(mat3, 'f16'),
+      meshRotation: stream.readObjArr(mat3, meshes.length, 'f16'),
+    });
+    stream.pos += 2; // padding
+  }
+
+  return { meshes: meshes, keyframes: keyframes };
+}
+
+
+
+function read_sec1(buf)
+{
+  var stream = new DataStream(buf);
+
+  var header = ['nSteps', 'offset'];
+  var table  = new Array(stream.readObj(header, 'u16').offset / 4);
+
+  stream.pos = 0;
+  var header = stream.readObjArr(header, table.length, 'u16');
+
+  for (var i = 0; i < table.length; ++i) {
+
+    table[i]   = new Array(header[i].nSteps);
+    stream.pos = header[i].offset;
+
+    for (var j = 0; j < table[i].length; ++j)
+      table[i][j] = stream.readObj(['keyframe', 'duration'], 'u16');
+  }
+
+  return table;
+}
+
+
+
+function read_tex(prim, stream)
+{
+  prim.clut = {tex: Array(prim.quad ? 4 : 3)};
+
+  for (var i = 0; i < prim.clut.tex.length; ++i) {
+    prim.clut.tex[i] = stream.u8(2);
+    if (i == 0) {
+      var cba = stream.u16(1)[0];
+      prim.clut.x = (cba & 0x3F)  << 4;
+      prim.clut.y = (cba & 0x7FC0) >> 6;
+    } else if (i == 1) {
+      var tsb = stream.u16(1)[0];
+      prim.clut.tpage = tsb & 0x1F;
+      prim.clut.abr   = (tsb & 0x60)  >> 5;
+      prim.clut.tpf   = (tsb & 0x180) >> 7;
+    } else {
+      stream.u16(1);
+    }
+  }
+}
+
+
+
+function read_color(prim, stream)
+{
+  prim.color = Array(prim.grd ? (prim.quad ? 4 : 3) : 1);
+  for (var i = 0; i < prim.color.length; ++i) {
+    prim.color[i] = stream.readObj(['r', 'g', 'b'], 'u8');
+    stream.u8(1);
+  }
+}
+
+
+
+function read_vertices(prim, stream)
+{
+  if (prim.lgt) {
+    if (prim.iip) {
+      prim.normals  = Array(prim.quad ? 4 : 3);
+      prim.vertices = Array(prim.normals.length);
+      for (var i = 0; i < prim.normals.length; ++i) {
+        var vals = stream.readObj(['n', 'v'], 'u16');
+        prim.normals[i]  = vals.n;
+        prim.vertices[i] = vals.v;
+      }
+    } else {
+      prim.normals  = stream.u16(1);
+      prim.vertices = stream.u16(prim.quad ? 4 : 3);
+    }
+  } else {
+    prim.normals  = Array();
+    prim.vertices = stream.u16(prim.quad ? 4 : 3);
+  }
+}
+
+
+
+function read_poly(prim, stream)
+{
+  if (prim.tme)
+    read_tex(prim, stream);
+
+  if (!prim.tme || (prim.tme && !prim.lgt))
+    read_color(prim, stream);
+
+  read_vertices(prim, stream); 
+}
+
+
+
+function read_primitive(stream)
+{
+  var h = stream.readObj(['olen', 'ilen', 'flag', 'mode'], 'u8');
+  var option = h.mode & 0x1F;
+
+  var prim = {
+    code:  (h.mode & 0xE0) >> 5,
+    grd:  !!(h.flag & 0x4),
+    fce:  !!(h.flag & 0x2),
+    lgt:  !(h.flag & 0x1),
+    iip:  !!(option & 0x10),
+    quad: !!(option & 0x8),
+    tme:  !!(option & 0x4),
+    abe:  !!(option & 0x2),
+    tge:  !(option & 0x1),
+  };
+
+  switch (prim.code) {
+    case 1:
+      read_poly(prim, stream);
+      break;
+    case 2:
+      read_line(prim, stream);
+      break;
+    case 3:
+      read_sprite(prim, stream);
+      break;
+  }
+  return prim;
+}
+
+
+
+function read_tmd(buf)
+{
+  var stream = new DataStream(buf);
+  var header = stream.readObj(['id', 'flags', 'nobj'], 'u32');
+
+  var objects   = new Array(header.nobj);
+  var obj_table = stream.readObjArr([
+    'vert_top',
+    'n_vert',
+    'normal_top',
+    'n_normal',
+    'primitive_top',
+    'n_primitive',
+    'scale',
+  ], objects.length, 'u32');
+
+  for (var i = 0; i < objects.length; ++i) {
+
+    stream.pos = 12 + obj_table[i].vert_top;
+    objects[i] = {vertices: stream.i16(obj_table[i].n_vert * 4)};
+
+    stream.pos = 12 + obj_table[i].normal_top;
+    objects[i].normals = stream.i16(obj_table[i].n_normal * 4);
+
+    stream.pos = 12 + obj_table[i].primitive_top;
+    objects[i].primitives = Array(obj_table[i].n_primitive);
+
+    for (var j = 0; j < objects[i].primitives.length; ++j)
+      objects[i].primitives[j] = read_primitive(stream);
+  }
+  return objects;
+}
+
+
+
+function read_header(stream)
+{
+  stream.pos += 4; // skip size
+  return stream.readObj(['dx', 'dy', 'w', 'h'], 'u16');
+}
+
+
+
+function read_16b(stream, len)
+{
+  var data   = stream.u16(len);
+  var colors = Array(data.length);
+  for (var i = 0; i < data.length; ++i) {
+    colors[i] = {
+      r: data[i] & 0x1F,
+      g: (data[i] & 0x3E0) >> 5,
+      b: (data[i] & 0x7C00) >> 10,
+      stp: !!(data[i] & 0x8000),
+    };
+  }
+  return colors;
+}
+
+
+
+function read_tim(buf)
+{
+  var stream = new DataStream(buf);
+
+  var h = stream.readObj(['id', 'flag'], 'u32');
+  var tim = { pmode: h.flag & 0x7 };
+
+  if (h.flag & 0x08) {
+    tim.clut = read_header(stream);
+    tim.clut.colors = read_16b(stream, tim.clut.w * tim.clut.h);
+  }
+
+  tim.data = read_header(stream);
+  switch (tim.pmode) {
+    case 0:
+      var data = stream.u8(tim.data.w * tim.data.h * 2);
+      tim.data.data = Array(data.length * 2);
+      for (var i = 0; i < data.length; ++i) {
+        tim.data.data[i * 2] = data[i] & 0xF;
+        tim.data.data[i * 2 + 1] = (data[i] & 0xF0) >> 4;
+      }
+      break;
+    case 1:
+      tim.data.data = stream.u8(tim.data.w * tim.data.h * 2);
+      break;
+    case 2:
+      read_16b(stream, tim.data.w * tim.data.h);
+      break;
+    case 3:
+      tim.data.data = stream.readObjArr(
+        ['r', 'g', 'b'], (tim.data.w * tim.data.h) / 3, 'u8'
+      );
+      break;
+  }
+  return tim;
+}
+
+
+
+function createShaderFromScript(gl, scriptId, shaderType)
+{
+  var shaderScript = document.getElementById(scriptId);
+  if (!shaderScript)
+    throw("Script element not found: " + scriptId);
+ 
+  var shaderSource = shaderScript.text;
+ 
+  if (!shaderType)
+    switch (shaderScript.dataset.type) {
+      case "vertex":
+        shaderType = gl.VERTEX_SHADER;
+        break;
+      case "fragment":
+        shaderType = gl.FRAGMENT_SHADER;
+        break;
+      default:
+        throw("Shader type not set");
+    }
+ 
+  var shader = gl.createShader(shaderType);
+ 
+  gl.shaderSource(shader, shaderSource);
+  gl.compileShader(shader);
+ 
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS))
+    throw "Could not compile shader: " + gl.getShaderInfoLog(shader);
+ 
+  return shader;
+}
+
+
+
+function createProgramFromScripts(gl, vertexShaderId, fragmentShaderId)
+{
+  var vertexShader   = createShaderFromScript(gl, vertexShaderId);
+  var fragmentShader = createShaderFromScript(gl, fragmentShaderId);
+
+  var program = gl.createProgram();
+ 
+  gl.attachShader(program, vertexShader);
+  gl.attachShader(program, fragmentShader);
+ 
+  gl.linkProgram(program);
+ 
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS))
+    throw ("Program failed to link: " + gl.getProgramInfoLog (program));
+ 
+  return program;
+}
+
+
+
+function getWebGlContext()
+{
+  var canvas = document.getElementById("screen");
+
+  var gl = canvas.getContext("webgl") ||
+           canvas.getContext("experimental-webgl");
+  if (!gl)
+    throw "Could not obtain webgl context";
+
+  return gl;
+}
+
+
+
+function DataWrite(buf)
+{
+  this.view = new DataView(buf);
+  this.pos = 0;
+}
+
+DataWrite.prototype.i8 = function(val)
+{
+  this.view.setInt8(this.pos++, val, true);
+};
+
+DataWrite.prototype.u8 = function(val)
+{
+  this.view.setUint8(this.pos++, val, true);
+};
+
+DataWrite.prototype.i16 = function(val)
+{
+  this.view.setInt16(this.pos, val, true);
+  this.pos += 2;
+};
+
+DataWrite.prototype.u16 = function(val)
+{
+  this.view.setUint16(this.pos, val, true);
+  this.pos += 2;
+};
+
+DataWrite.prototype.i32 = function(val)
+{
+  this.view.setInt32(this.pos, val, true);
+  this.pos += 4;
+};
+
+DataWrite.prototype.u32 = function(val)
+{
+  this.view.setUint32(this.pos, val, true);
+  this.pos += 4;
+};
+
+DataWrite.prototype.f32 = function(val)
+{
+  this.view.setFloat32(this.pos, val, true);
+  this.pos += 4;
+};
+
+
+function packMesh(mesh, tim, offset, gl, program)
+{
+  var buf  = new ArrayBuffer(36 * mesh.primitives.length * 3);
+  var view = new DataWrite(buf);
+
+  mesh.primitives.forEach(function(p) {
+    for (var i = 0; i < 3; ++i) {
+
+      for (var j = 0; j < 3; ++j)
+        view.i16(mesh.vertices[p.vertices[i] * 4 + j] + offset[j]);
+
+      view.pos += 2;
+
+      for (var j = 0; j < 3; ++j)
+        view.f32(mesh.normals[p.normals[i] * 4 + j] / 4096);
+
+      view.f32(((p.clut.tex[i][0] + p.clut.tpage * 128) - tim.data.dx) / (tim.data.w * 2));
+      view.f32((p.clut.tex[i][1] - tim.data.dy) / tim.data.h);
+      view.f32((p.clut.x - tim.clut.dx) / tim.clut.w);
+      view.f32((p.clut.y - tim.clut.dy) / tim.clut.h);
+    }
+  });
+
+  return {
+    data: buf,
+    buf: gl.createBuffer(),
+    nVertices: mesh.primitives.length * 3,
+  };
+
+}
+
+
+
+function packTex(tex, gl, program)
+{
+  var loadUniform = function(index, uniform, format, type, w, h, data)
+  {
+    var tex = gl.createTexture();
+    gl.activeTexture(gl.TEXTURE0 + index);
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.uniform1i(gl.getUniformLocation(program, uniform), index);
+    gl.texImage2D(gl.TEXTURE_2D, 0, format, w, h, 0, format, type, data);
+  }
+  
+  var clut = new Uint16Array(tex.clut.colors.length);
+  for (var i = 0; i < clut.length; ++i)
+    clut[i] = 
+      tex.clut.colors[i].b << 1  |
+      tex.clut.colors[i].g << 6  |
+      tex.clut.colors[i].r << 11 | 1;
+
+  loadUniform(0, 'clut', gl.RGBA, gl.UNSIGNED_SHORT_5_5_5_1,
+    tex.clut.w, tex.clut.h, clut);
+  loadUniform(1, 'texture', gl.ALPHA, gl.UNSIGNED_BYTE,
+    tex.data.w * 2, tex.data.h, tex.data.data);
+}
+
+
+
+function printClut(clut)
+{
+  var clutElem = document.getElementById('clut');
+  while (clutElem.firstChild)
+    clutElem.removeChild(clutElem.firstChild);
+
+  for (var i = 0; i < clut.h; ++i) {
+    var row = document.createElement('div');
+    row.classList.add('row');
+    for (var j = 0; j < clut.w; ++j) {
+      var c = clut.colors[j + i * clut.w];
+      var color = document.createElement('span');
+      color.classList.add('color');
+      color.style.backgroundColor = 'rgb('+[c.r << 3, c.g << 3, c.b << 3].join(',')+')';
+      row.appendChild(color);
+    }
+    clutElem.appendChild(row);
+  }
+}
+
+
+function main()
+{
+  var buf = this.result;
+  var offsets = new Uint32Array(buf, buf.byteLength - 4 * 4);
+  var sec0 = read_sec0(buf.slice(offsets[0], offsets[1]));
+  var sec1 = read_sec1(buf.slice(offsets[1], offsets[2]));
+  var tmd  = read_tmd(buf.slice(offsets[2], offsets[3]));
+  var tim  = read_tim(buf.slice(offsets[3]));
+
+  var gl = getWebGlContext();
+  var program = createProgramFromScripts(gl, "vshader", "fshader");
+  gl.useProgram(program);
+  gl.enable(gl.DEPTH_TEST);
+  gl.enable(gl.CULL_FACE);
+  gl.frontFace(gl.CW);
+  gl.cullFace(gl.BACK);
+
+  packTex(tim, gl, program);
+
+  var addMesh = function(mesh, offset) {
+    var meshOffset = [];
+    for (var i = 0; i < offset.length; ++i)
+      meshOffset[i] = offset[i] + sec0.meshes[mesh].offset[i];
+
+    var data = packMesh(tmd[mesh], tim, meshOffset, gl, program);
+    data.children = [];
+
+    for (var i = 0; i < sec0.meshes[mesh].children.length; ++i)
+      data.children.push(addMesh(sec0.meshes[mesh].children[i], meshOffset));
+
+    return data;
+  };
+
+  printClut(tim.clut);
+
+  var root = addMesh(0, [0, 0, 0]);
+
+  var drawframe = function() {
+    var loadAttr = function(name, size, type, normalize, offset) {
+      var attrib = gl.getAttribLocation(program, name);
+      if (attrib == -1)
+        throw "Invalid attribute: " + name;
+      gl.enableVertexAttribArray(attrib);
+      gl.vertexAttribPointer(attrib, size, type, normalize, 36, offset);
+    }
+
+    var draw = function(mesh) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, mesh.buf);
+      gl.bufferData(gl.ARRAY_BUFFER, mesh.data, gl.STATIC_DRAW);
+      loadAttr('a_vert', 3, gl.SHORT, true, 0);
+      loadAttr('a_normal', 3, gl.FLOAT, false, 8);
+      loadAttr('a_uv', 2, gl.FLOAT, false, 20);
+      loadAttr('a_clut_xy', 2, gl.FLOAT, false, 28);
+      gl.drawArrays(gl.TRIANGLES, 0, mesh.nVertices);
+      mesh.children.forEach(function(c) { draw(c); });
+    }
+    draw(root);
+    window.requestAnimationFrame(drawframe);
+  }
+  window.requestAnimationFrame(drawframe);
+}
+
+window.onload = function() {
+  document.getElementById('emdlist').onchange = function() {
+    var reader = new FileReader();
+    reader.onload = main;
+    reader.readAsArrayBuffer(document.getElementById('file').files[this.selectedIndex]);
+  };
+  document.getElementById('file').onchange = function() {
+    var list = document.getElementById('emdlist');
+    while (list.firstChild)
+      list.removeChild(list.firstChild);
+    for (var i = 0; i < this.files.length; ++i) {
+      var op = document.createElement('option');
+      op.value = i;
+      op.text = this.files[i].name;
+      list.add(op);
+    }
+  };
+};
+
+</script>
+
+<script id="vshader" type="text/plain" data-type="vertex">
+
+attribute vec3 a_vert;
+attribute vec3 a_normal;
+attribute vec2 a_clut_xy;
+attribute vec2 a_uv;
+varying vec3 v_normal;
+varying vec2 v_clut_xy;
+varying vec2 v_uv;
+ 
+void main()
+{
+  mat3 rotate = mat3(
+    0, 0, -1,
+    0, -1, 0,
+    1, 0, 0
+  );
+
+  gl_Position = vec4(rotate * (a_vert * 20.) + vec3(0, -.88, 0), 1);
+
+  v_normal  = a_normal;
+  v_clut_xy = a_clut_xy;
+  v_uv      = a_uv;
+}
+
+</script>
+
+<script id="fshader" type="text/plain" data-type="fragment">
+
+precision mediump float;
+
+uniform sampler2D clut;
+uniform sampler2D texture;
+varying vec3 v_normal;
+varying vec2 v_clut_xy;
+varying vec2 v_uv;
+
+void main()
+{
+  vec4 index = texture2D(texture, v_uv);
+  vec4 texel = texture2D(clut, vec2(index.a + v_clut_xy.x, v_clut_xy.y));
+  gl_FragColor = texel;
+}
+
+</script>
+
+<style>
+
+html
+{
+  height: 100%;
+}
+
+body
+{
+  height: 100%;
+  margin: 0;
+  font-family: monospace;
+  background-image: linear-gradient(to bottom, gray, silver);
+  overflow: hidden;
+}
+
+#controls
+{
+  width: 25%;
+  position: fixed;
+  left: 0;
+  top: 0;
+  border-color: black;
+  background-color: rgba(0, 0, 0, .5);
+}
+
+#file
+{
+  width: 100%;
+}
+
+#emdlist
+{
+  width: 100%;
+  background-color: transparent;
+}
+
+#screen
+{
+  margin: auto;
+  display: block;
+}
+
+#clut
+{
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  background-color: rgba(0, 0, 0, .5);
+}
+
+.color
+{
+  width: 4px;
+  height: 4px;
+  display: inline-block;
+}
+
+</style>
+<fieldset id="controls">
+  <input type="file" accept=".emd" multiple id="file"/>
+  <select id="emdlist">
+  </select>
+</fieldset>
+<section id="clut">
+</section>
+<canvas width="850" height="850" id="screen"></canvas>
+
