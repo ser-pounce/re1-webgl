@@ -469,18 +469,20 @@ function packMesh(mesh, tim, offset, gl, program)
     buf: gl.createBuffer(),
     nVertices: mesh.primitives.length * 3,
   };
-
 }
 
 
+var clutBuf, texBuf;
 
 function packTex(tex, gl, program)
 {
-  var loadUniform = function(index, uniform, format, type, w, h, data)
+  var loadUniform = function(index, uniform, format, type, w, h, data, buf)
   {
-    var tex = gl.createTexture();
+    if (buf)
+      gl.deleteTexture(buf);
+    buf = gl.createTexture();
     gl.activeTexture(gl.TEXTURE0 + index);
-    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.bindTexture(gl.TEXTURE_2D, buf);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     gl.uniform1i(gl.getUniformLocation(program, uniform), index);
@@ -495,9 +497,9 @@ function packTex(tex, gl, program)
       tex.clut.colors[i].r << 11 | 1;
 
   loadUniform(0, 'clut', gl.RGBA, gl.UNSIGNED_SHORT_5_5_5_1,
-    tex.clut.w, tex.clut.h, clut);
+    tex.clut.w, tex.clut.h, clut, clutBuf);
   loadUniform(1, 'texture', gl.ALPHA, gl.UNSIGNED_BYTE,
-    tex.data.w * 2, tex.data.h, tex.data.data);
+    tex.data.w * 2, tex.data.h, tex.data.data, texBuf);
 }
 
 
@@ -522,6 +524,9 @@ function printClut(clut)
   }
 }
 
+
+var root;
+var render;
 
 function main()
 {
@@ -558,7 +563,16 @@ function main()
 
   printClut(tim.clut);
 
-  var root = addMesh(0, [0, 0, 0]);
+  function deleteBuffers(mesh) {
+    gl.deleteBuffer(mesh.buf);
+    mesh.children.forEach(deleteBuffers);
+  }
+
+  window.cancelAnimationFrame(render);
+
+  if (root)
+    deleteBuffers(root);
+  root = addMesh(0, [0, 0, 0]);
 
   var drawframe = function() {
     var loadAttr = function(name, size, type, normalize, offset) {
@@ -580,7 +594,7 @@ function main()
       mesh.children.forEach(function(c) { draw(c); });
     }
     draw(root);
-    window.requestAnimationFrame(drawframe);
+    render = window.requestAnimationFrame(drawframe);
   }
   window.requestAnimationFrame(drawframe);
 }
