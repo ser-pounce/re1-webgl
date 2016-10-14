@@ -1,0 +1,10 @@
+{
+  "name": "re-model-viewer",
+  "version": "1.0.0-alpha",
+  "dependencies" : {
+    "babel-cli": "*",
+    "babel-preset-latest": "*",
+    "babel-plugin-transform-es2015-modules-umd": "*"
+  }
+}
+
